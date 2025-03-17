@@ -1,6 +1,6 @@
 # PDF 文档知识库 RAG 应用
 
-基于 LlamaIndex 的 PDF 文档检索增强生成(RAG)应用，支持构建 PDF 知识库并进行智能问答。
+一个主要用于代码学习的基于 LlamaIndex 的 PDF 文档检索增强生成(RAG)应用，支持构建 PDF 知识库并进行智能问答。
 
 ## 功能特点
 

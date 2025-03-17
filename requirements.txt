@@ -8,7 +8,7 @@ pypdf==4.0.1
 python-dotenv==1.0.0
 psycopg2-binary==2.9.9
 gradio==4.19.2
-pydantic==2.0.0
+pydantic==2.1.1
 sqlalchemy==2.0.25
 pgvector==0.2.4
 fastapi==0.103.2
