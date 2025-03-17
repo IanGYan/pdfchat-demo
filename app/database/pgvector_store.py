@@ -26,7 +26,10 @@ class PGVectorManager:
         Args:
             table_name: 存储表名
         """
-        self.table_name = table_name
+        # 原始表名（不带前缀）
+        self.base_table_name = table_name
+        # 实际表名（LlamaIndex会自动添加"data_"前缀）
+        self.actual_table_name = f"data_{table_name}"
         self.connection_string = Config.PGVECTOR_URL
         if not self.connection_string:
             raise ValueError("未设置PostgreSQL连接URL，请检查环境变量PGVECTOR_URL")
@@ -40,6 +43,10 @@ class PGVectorManager:
         self.index = None
         # 保存一个单独的数据库连接用于辅助操作
         self.conn = None
+        # 混合搜索设置
+        self.hybrid_search = True
+        # 文本搜索配置，使用PostgreSQL默认支持的'simple'
+        self.text_search_config = "simple"
         
     def initialize(self) -> None:
         """初始化向量存储"""
@@ -68,71 +75,102 @@ class PGVectorManager:
             except Exception as conn_err:
                 logger.warning(f"创建辅助数据库连接失败: {str(conn_err)}，某些功能可能不可用")
                 self.conn = None
-            
-            # 创建PGVectorStore，使用hybrid_search=True
-            try:
-                logger.info("使用from_params方法创建PGVectorStore...")
-                url = make_url(self.connection_string)
-                self.vector_store = PGVectorStore.from_params(
-                    host=url.host,
-                    port=url.port,
-                    database=url.database,
-                    user=url.username,
-                    password=url.password,
-                    table_name=self.table_name,
-                    embed_dim=self.embed_dim,
-                    hybrid_search=True,
-                    text_search_config="chinese",
-                    hnsw_kwargs={
-                        "hnsw_m": 16,
-                        "hnsw_ef_construction": 64,
-                        "hnsw_ef_search": 40,
-                        "hnsw_dist_method": "vector_cosine_ops",
-                    },
-                )
-                logger.info("成功使用from_params方法创建PGVectorStore")
-            except Exception as e:
-                logger.warning(f"使用from_params方法创建PGVectorStore失败: {str(e)}")
-                raise
-            
-            # 检查并创建表（如果必要）
+
+            # 检查表是否存在，如果不存在则创建表
             if self.conn:
                 try:
                     with self.conn.cursor() as cursor:
-                        # 检查表是否存在
-                        cursor.execute(
-                            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = %s)",
-                            (self.table_name,)
-                        )
+                        # 检查实际表名（带data_前缀）
+                        cursor.execute(f"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{self.actual_table_name}')")
                         table_exists = cursor.fetchone()[0]
                         
                         if not table_exists:
-                            logger.info(f"表 {self.table_name} 不存在，尝试创建...")
-                            # 执行创建表的SQL（这应当由PGVectorStore自动完成，但为确保无误，手动尝试创建）
-                            try:
-                                # 创建表的SQL示例（实际应参考LlamaIndex的实现）
-                                create_table_sql = f"""
-                                CREATE TABLE IF NOT EXISTS {self.table_name} (
-                                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                                    embedding VECTOR({self.embed_dim}),
-                                    document TEXT,
-                                    metadata JSONB,
-                                    node_id TEXT,
-                                    document_id TEXT
-                                );
+                            logger.info(f"表 {self.actual_table_name} 不存在，尝试创建...")
+                            # 创建表的SQL，使用simple文本搜索配置
+                            create_table_sql = f"""
+                            CREATE TABLE IF NOT EXISTS {self.actual_table_name} (
+                                id BIGSERIAL NOT NULL,
+                                text VARCHAR NOT NULL,
+                                metadata_ JSON,
+                                node_id VARCHAR,
+                                embedding VECTOR({self.embed_dim}),
+                                text_search_tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('{self.text_search_config}', text)) STORED,
+                                PRIMARY KEY (id)
+                            );
+                            """
+                            cursor.execute(create_table_sql)
+                            
+                            # 创建索引
+                            create_index_sql = f"""
+                            CREATE INDEX IF NOT EXISTS {self.actual_table_name}_text_search_idx 
+                            ON {self.actual_table_name} USING GIN (text_search_tsv);
+                            
+                            CREATE INDEX IF NOT EXISTS {self.actual_table_name}_embedding_idx
+                            ON {self.actual_table_name} USING ivfflat (embedding vector_cosine_ops)
+                            WITH (lists = 100);
+                            """
+                            cursor.execute(create_index_sql)
+                            
+                            logger.info(f"表 {self.actual_table_name} 创建成功，并添加了必要的索引")
+                        else:
+                            # 检查text_search_tsv列是否存在
+                            cursor.execute(f"""
+                            SELECT EXISTS (
+                                SELECT FROM information_schema.columns 
+                                WHERE table_name = '{self.actual_table_name}' AND column_name = 'text_search_tsv'
+                            )
+                            """)
+                            tsvector_exists = cursor.fetchone()[0]
+                            
+                            if not tsvector_exists:
+                                logger.info(f"表 {self.actual_table_name} 缺少text_search_tsv列，添加该列...")
+                                alter_table_sql = f"""
+                                ALTER TABLE {self.actual_table_name} 
+                                ADD COLUMN text_search_tsv TSVECTOR 
+                                GENERATED ALWAYS AS (to_tsvector('{self.text_search_config}', text)) STORED;
+                                
+                                CREATE INDEX IF NOT EXISTS {self.actual_table_name}_text_search_idx 
+                                ON {self.actual_table_name} USING GIN (text_search_tsv);
                                 """
-                                cursor.execute(create_table_sql)
-                                logger.info(f"成功创建表 {self.table_name}")
-                            except Exception as table_err:
-                                logger.warning(f"手动创建表失败: {str(table_err)}，将依赖PGVectorStore自动创建")
-                except Exception as check_err:
-                    logger.error(f"检查表存在性失败: {str(check_err)}")
+                                cursor.execute(alter_table_sql)
+                                logger.info(f"成功为表 {self.actual_table_name} 添加text_search_tsv列和索引")
+                            
+                            logger.info(f"表 {self.actual_table_name} 已存在并验证了结构")
+                except Exception as e:
+                    logger.error(f"检查和创建表失败: {str(e)}")
+                    raise
+            else:
+                logger.warning("无法创建辅助数据库连接，某些功能可能不可用")
+                raise
+
+            # 解析连接字符串获取参数
+            url = make_url(self.connection_string)
+            
+            # 创建PGVectorStore，使用hybrid_search=True
+            try:
+                logger.info(f"使用from_params方法创建PGVectorStore (hybrid_search={self.hybrid_search})...")
+                
+                self.vector_store = PGVectorStore.from_params(
+                    host=url.host,
+                    port=url.port or 5432,
+                    database=url.database,
+                    user=url.username,
+                    password=url.password,
+                    table_name=self.base_table_name,  # 使用原始表名，PGVectorStore会自动添加前缀
+                    embed_dim=self.embed_dim,
+                    hybrid_search=self.hybrid_search,
+                    text_search_config=self.text_search_config,  # 使用simple文本搜索配置
+                )
+                logger.info("成功创建PGVectorStore")
+            except Exception as e:
+                logger.warning(f"使用from_params方法创建PGVectorStore失败: {str(e)}")
+                raise
             
             self.storage_context = StorageContext.from_defaults(
                 vector_store=self.vector_store
             )
             
-            logger.info(f"成功初始化PostgreSQL向量存储，表名: {self.table_name}，向量维度: {self.embed_dim}")
+            logger.info(f"成功初始化PostgreSQL向量存储，基础表名: {self.base_table_name}，实际表名: {self.actual_table_name}，向量维度: {self.embed_dim}，混合搜索: {self.hybrid_search}，文本搜索配置: {self.text_search_config}")
         except Exception as e:
             logger.error(f"初始化PostgreSQL向量存储失败: {str(e)}")
             raise
@@ -180,15 +218,15 @@ class PGVectorManager:
         if self.vector_store:
             try:
                 self.vector_store.delete(delete_all=True)
-                logger.info(f"已清空表 {self.table_name} 中的所有数据")
+                logger.info(f"已清空表 {self.actual_table_name} 中的所有数据")
             except Exception as e:
                 logger.error(f"清空数据失败: {str(e)}")
                 # 尝试使用直接SQL语句清空数据
                 if self.conn and not self.conn.closed:
                     try:
                         with self.conn.cursor() as cursor:
-                            cursor.execute(f"TRUNCATE TABLE {self.table_name}")
-                            logger.info(f"通过SQL语句清空表 {self.table_name} 成功")
+                            cursor.execute(f"TRUNCATE TABLE {self.actual_table_name}")
+                            logger.info(f"通过SQL语句清空表 {self.actual_table_name} 成功")
                     except Exception as sql_err:
                         logger.error(f"通过SQL语句清空数据失败: {str(sql_err)}")
     
@@ -205,16 +243,16 @@ class PGVectorManager:
                         # 先检查表是否存在
                         cursor.execute(
                             "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = %s)",
-                            (self.table_name,)
+                            (self.actual_table_name,)
                         )
                         table_exists = cursor.fetchone()[0]
                         
                         if not table_exists:
-                            logger.info(f"表 {self.table_name} 不存在，可能是首次运行")
+                            logger.info(f"表 {self.actual_table_name} 不存在，可能是首次运行")
                             return 0
                             
                         # 表存在，查询数量
-                        cursor.execute(f"SELECT COUNT(*) FROM {self.table_name}")
+                        cursor.execute(f"SELECT COUNT(*) FROM {self.actual_table_name}")
                         count = cursor.fetchone()[0]
                         return count
                 except Exception as sql_err:
