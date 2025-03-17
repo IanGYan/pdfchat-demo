@@ -1,0 +1,39 @@
+.ipynb_checkpoints
+.backup
+*.ipynb~
+*.pyc
+__pycache__
+.vscode
+
+.env
+
+.output
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+env/
+.env
+
+# Logs
+logs/
+*.log
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 临时文件
+*.tmp
+.DS_Store
