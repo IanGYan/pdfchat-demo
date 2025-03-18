@@ -37,5 +37,4 @@ build/
 # 临时文件
 *.tmp
 .DS_Store
-.pm/
 test-pdf-dir/
